@@ -334,10 +334,11 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, records)
 
-    # Sauvegarder le résumé de la semaine courante
-    current = analysis["current"]
-    if not current.empty:
-        start, end = get_week_bounds(0)
+    # Sauvegarder un résumé pour CHAQUE semaine (historique complet)
+    for week_idx, df in data.items():
+        if df.empty:
+            continue
+        start, end = get_week_bounds(week_idx)
         conn.execute("""
             INSERT OR REPLACE INTO weekly_summary
             (site, week_start, week_end, total_queries, total_clicks, total_impressions,
@@ -345,15 +346,15 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             short_name, start, end,
-            len(current),
-            int(current["clicks"].sum()),
-            int(current["impressions"].sum()),
-            round(float(current["position"].mean()), 1),
-            len(analysis["progressions"]),
-            len(analysis["drops"]),
-            len(analysis["quickwins"]),
-            len(analysis["low_ctr"]),
-            len(analysis["new_queries"]),
+            len(df),
+            int(df["clicks"].sum()),
+            int(df["impressions"].sum()),
+            round(float(df["position"].mean()), 1),
+            len(analysis["progressions"]) if week_idx == 0 else 0,
+            len(analysis["drops"]) if week_idx == 0 else 0,
+            len(analysis["quickwins"]) if week_idx == 0 else 0,
+            len(analysis["low_ctr"]) if week_idx == 0 else 0,
+            len(analysis["new_queries"]) if week_idx == 0 else 0,
             now,
         ))
 
@@ -402,7 +403,7 @@ def push_to_supabase(supabase_config: dict, site_url: str, data: dict, analysis:
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             resp = httpx.post(
-                f"{url}/rest/v1/weekly_data",
+                f"{url}/rest/v1/weekly_data?on_conflict=site,week_start,query,page",
                 headers=headers,
                 json=batch,
                 timeout=30.0,
@@ -410,33 +411,40 @@ def push_to_supabase(supabase_config: dict, site_url: str, data: dict, analysis:
             if resp.status_code not in (200, 201):
                 print(f"    [SUPABASE] Erreur weekly_data semaine {start}: {resp.status_code}")
 
-    # Pousser le résumé de la semaine courante
-    current = analysis["current"]
-    if not current.empty:
-        start, end = get_week_bounds(0)
-        summary = {
+    # Pousser un résumé pour CHAQUE semaine (historique complet)
+    summaries = []
+    for week_idx, df in data.items():
+        if df.empty:
+            continue
+        start, end = get_week_bounds(week_idx)
+        summaries.append({
             "site": short_name,
             "week_start": start,
             "week_end": end,
-            "total_queries": len(current),
-            "total_clicks": int(current["clicks"].sum()),
-            "total_impressions": int(current["impressions"].sum()),
-            "avg_position": round(float(current["position"].mean()), 1),
-            "progressions": len(analysis["progressions"]),
-            "drops": len(analysis["drops"]),
-            "quickwins": len(analysis["quickwins"]),
-            "low_ctr": len(analysis["low_ctr"]),
-            "new_queries": len(analysis["new_queries"]),
+            "total_queries": len(df),
+            "total_clicks": int(df["clicks"].sum()),
+            "total_impressions": int(df["impressions"].sum()),
+            "avg_position": round(float(df["position"].mean()), 1),
+            # Les détections ne sont calculées que pour semaine 0
+            "progressions": len(analysis["progressions"]) if week_idx == 0 else 0,
+            "drops": len(analysis["drops"]) if week_idx == 0 else 0,
+            "quickwins": len(analysis["quickwins"]) if week_idx == 0 else 0,
+            "low_ctr": len(analysis["low_ctr"]) if week_idx == 0 else 0,
+            "new_queries": len(analysis["new_queries"]) if week_idx == 0 else 0,
             "collected_at": now,
-        }
+        })
+
+    # Envoyer par lots de 50
+    for i in range(0, len(summaries), 50):
+        batch = summaries[i:i + 50]
         resp = httpx.post(
-            f"{url}/rest/v1/weekly_summary",
+            f"{url}/rest/v1/weekly_summary?on_conflict=site,week_start",
             headers=headers,
-            json=summary,
+            json=batch,
             timeout=30.0,
         )
         if resp.status_code not in (200, 201):
-            print(f"    [SUPABASE] Erreur weekly_summary: {resp.status_code}")
+            print(f"    [SUPABASE] Erreur weekly_summary batch: {resp.status_code}")
 
 
 def fetch_sites_from_supabase(supabase_config: dict) -> list:
