@@ -180,6 +180,7 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
             "quickwins": pd.DataFrame(),
             "low_ctr": pd.DataFrame(),
             "new_queries": pd.DataFrame(),
+            "cannibalization": pd.DataFrame(),
         }
 
     # ---- Merge semaine N et N-1 pour comparer ----
@@ -225,7 +226,21 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
         (current["position"] >= qw_min)
         & (current["position"] <= qw_max)
         & (current["impressions"] >= qw_imp)
-    ].sort_values("impressions", ascending=False)
+    ].copy()
+
+    # Priority score for quick wins
+    expected_ctr_map = {1: 30, 2: 15, 3: 10, 4: 7, 5: 5, 6: 4, 7: 3, 8: 2.5, 9: 2, 10: 1.5, 11: 1, 12: 1}
+    if not quickwins.empty:
+        quickwins["expected_ctr"] = quickwins["position"].apply(
+            lambda p: expected_ctr_map.get(int(round(p)), 1)
+        )
+        quickwins["priority_score"] = (
+            quickwins["impressions"]
+            * (1 / quickwins["position"])
+            * (quickwins["expected_ctr"] - quickwins["ctr"]).clip(lower=0)
+        )
+        quickwins["priority_score"] = quickwins["priority_score"].round(1)
+        quickwins = quickwins.sort_values("priority_score", ascending=False)
 
     # ---- 👁️ Mauvais CTR ----
     ctr_imp = thresholds["low_ctr_impressions_min"]
@@ -244,6 +259,21 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
     else:
         new_queries = pd.DataFrame()
 
+    # ---- 🔄 Cannibalisation : requêtes avec 2+ pages différentes ----
+    if not current.empty:
+        pages_per_query = current.groupby("query").agg(
+            page_count=("page", "nunique"),
+            pages=("page", lambda x: list(x.unique())),
+            clicks=("clicks", "sum"),
+            impressions=("impressions", "sum"),
+            positions=("position", lambda x: list(x.round(1))),
+        ).reset_index()
+        cannibalization = pages_per_query[pages_per_query["page_count"] >= 2].copy()
+        cannibalization = cannibalization.sort_values("impressions", ascending=False)
+        cannibalization = cannibalization.drop(columns=["page_count"])
+    else:
+        cannibalization = pd.DataFrame()
+
     return {
         "current": merged,
         "progressions": progressions,
@@ -251,6 +281,7 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
         "quickwins": quickwins,
         "low_ctr": low_ctr,
         "new_queries": new_queries,
+        "cannibalization": cannibalization,
     }
 
 
@@ -295,6 +326,7 @@ def init_db(db_path: str):
             quickwins INTEGER DEFAULT 0,
             low_ctr INTEGER DEFAULT 0,
             new_queries INTEGER DEFAULT 0,
+            cannibalization INTEGER DEFAULT 0,
             collected_at TEXT NOT NULL,
             UNIQUE(site, week_start)
         )
@@ -342,8 +374,8 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
         conn.execute("""
             INSERT OR REPLACE INTO weekly_summary
             (site, week_start, week_end, total_queries, total_clicks, total_impressions,
-             avg_position, progressions, drops, quickwins, low_ctr, new_queries, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             avg_position, progressions, drops, quickwins, low_ctr, new_queries, cannibalization, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             short_name, start, end,
             len(df),
@@ -355,6 +387,7 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
             len(analysis["quickwins"]) if week_idx == 0 else 0,
             len(analysis["low_ctr"]) if week_idx == 0 else 0,
             len(analysis["new_queries"]) if week_idx == 0 else 0,
+            len(analysis["cannibalization"]) if week_idx == 0 else 0,
             now,
         ))
 
@@ -431,6 +464,7 @@ def push_to_supabase(supabase_config: dict, site_url: str, data: dict, analysis:
             "quickwins": len(analysis["quickwins"]) if week_idx == 0 else 0,
             "low_ctr": len(analysis["low_ctr"]) if week_idx == 0 else 0,
             "new_queries": len(analysis["new_queries"]) if week_idx == 0 else 0,
+            "cannibalization": len(analysis["cannibalization"]) if week_idx == 0 else 0,
             "collected_at": now,
         })
 
@@ -512,6 +546,7 @@ def generate_excel(all_results: dict, output_dir: str) -> str:
                 "Quick Wins": analysis["quickwins"],
                 "Mauvais CTR": analysis["low_ctr"],
                 "Nouvelles": analysis["new_queries"],
+                "Cannibalisation": analysis["cannibalization"],
             }
             for seg_name, seg_df in segments.items():
                 seg_sheet = f"{short_name[:20]}_{seg_name}".replace("/", "")[:31]
@@ -529,6 +564,7 @@ def generate_excel(all_results: dict, output_dir: str) -> str:
                 "Quick Wins": len(analysis["quickwins"]),
                 "Mauvais CTR": len(analysis["low_ctr"]),
                 "Nouvelles requêtes": len(analysis["new_queries"]),
+                "Cannibalisation": len(analysis["cannibalization"]),
             })
 
         # --- Onglet Résumé global ---
@@ -626,6 +662,18 @@ def generate_text_summary(all_results: dict) -> str:
                              f" | {row['impressions']} imp | {row['clicks']} clicks")
             if len(nq) > 5:
                 lines.append(f"     ... et {len(nq) - 5} autres")
+            lines.append("")
+
+        # Cannibalisation
+        cannibal = analysis["cannibalization"]
+        if not cannibal.empty:
+            lines.append(f"  🔄 Cannibalisation : {len(cannibal)} requêtes")
+            for _, row in cannibal.head(5).iterrows():
+                pages_list = row["pages"] if isinstance(row["pages"], list) else [row["pages"]]
+                lines.append(f"     ⚡ {row['query'][:50]} : {len(pages_list)} pages"
+                             f" | {row['impressions']} imp | {row['clicks']} clicks")
+            if len(cannibal) > 5:
+                lines.append(f"     ... et {len(cannibal) - 5} autres")
             lines.append("")
 
         lines.append("")
