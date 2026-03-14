@@ -1,0 +1,42 @@
+# ============================================================
+# GSC Ranking Tracker - Configuration
+# ============================================================
+
+# Liste des sites à tracker
+# Utilisez le format exact affiché par list_sites.py
+# Pour ajouter un site :  - "https://monsite.fr/"
+sites:
+  - "https://exemple.fr/"
+  - "https://monsite.com/"
+
+# Nombre de semaines d'historique à récupérer
+weeks_history: 16
+
+# Seuils de détection
+thresholds:
+  # Variation de position pour déclencher une alerte
+  position_drop: 3        # Chute > X positions = alerte rouge
+  position_gain: 3        # Gain > X positions = progression verte
+
+  # Quick wins : requêtes proches du top 3
+  quickwin_pos_min: 4
+  quickwin_pos_max: 12
+  quickwin_impressions_min: 100
+
+  # Mauvais CTR
+  low_ctr_impressions_min: 200
+  low_ctr_threshold: 3.0  # CTR < X% = mauvais CTR
+
+# Dossier de sortie des rapports
+output_dir: "./rapports"
+
+# Fichier credentials OAuth2 (téléchargé depuis Google Cloud Console)
+credentials_file: "./credentials.json"
+
+# Fichier token (généré automatiquement après la première auth)
+token_file: "./token.json"
+
+# Supabase (pour le dashboard en ligne)
+supabase:
+  url: "https://VOTRE_PROJET.supabase.co"
+  key: "VOTRE_CLE_ANON"

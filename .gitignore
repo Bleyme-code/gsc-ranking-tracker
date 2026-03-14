@@ -1,0 +1,14 @@
+# Fichiers sensibles - NE PAS COMMIT
+credentials.json
+token.json
+config.yaml
+.streamlit/secrets.toml
+
+# Données locales
+gsc_data.db
+rapports/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
