@@ -347,9 +347,12 @@ def page_site_detail():
             elif filter_type == "🆕 Nouvelles":
                 filtered = filtered[filtered["position_prev"].isna()]
             elif filter_type == "🔄 Cannibalisation":
-                # Detect cannibalization: queries with 2+ pages
-                cannibal_queries = filtered.groupby("query").filter(lambda g: g["page"].nunique() >= 2)
+                # Detect cannibalization: queries with 2+ distinct pages (ignoring # fragments)
+                filtered = filtered.copy()
+                filtered["page_clean"] = filtered["page"].str.split("#").str[0]
+                cannibal_queries = filtered.groupby("query").filter(lambda g: g["page_clean"].nunique() >= 2)
                 filtered = cannibal_queries.sort_values(["query", "position"])
+                filtered = filtered.drop(columns=["page_clean"])
 
             if search:
                 filtered = filtered[filtered["query"].str.contains(search, case=False, na=False)]
@@ -550,9 +553,13 @@ def page_cannibalization():
         st.warning("Pas de données pour cette semaine.")
         return
 
-    # Detect cannibalized queries
+    # Normaliser les URLs en supprimant les fragments (#...)
+    data = data.copy()
+    data["page_clean"] = data["page"].str.split("#").str[0]
+
+    # Detect cannibalized queries (2+ pages distinctes sans les #)
     query_pages = data.groupby("query").agg(
-        page_count=("page", "nunique"),
+        page_count=("page_clean", "nunique"),
         total_clicks=("clicks", "sum"),
         total_impressions=("impressions", "sum"),
     ).reset_index()
@@ -580,7 +587,9 @@ def page_cannibalization():
             if s_weeks:
                 s_data = get_week_data(s, s_weeks[0], limit=5000)
                 if not s_data.empty:
-                    s_qp = s_data.groupby("query").agg(page_count=("page", "nunique")).reset_index()
+                    s_data = s_data.copy()
+                    s_data["page_clean"] = s_data["page"].str.split("#").str[0]
+                    s_qp = s_data.groupby("query").agg(page_count=("page_clean", "nunique")).reset_index()
                     count = len(s_qp[s_qp["page_count"] >= 2])
                     site_cannibal_counts.append({"Site": s, "Requêtes cannibalisées": count})
         if site_cannibal_counts:
@@ -597,13 +606,21 @@ def page_cannibalization():
 
     for _, qrow in display_queries.head(50).iterrows():
         query = qrow["query"]
-        query_data = data[data["query"] == query].sort_values("position")
+        query_data = data[data["query"] == query].copy()
+        # Agréger par page nettoyée (sans #fragment)
+        query_data_grouped = query_data.groupby("page_clean").agg(
+            clicks=("clicks", "sum"),
+            impressions=("impressions", "sum"),
+            ctr=("ctr", "mean"),
+            position=("position", "min"),
+        ).reset_index().rename(columns={"page_clean": "page"}).sort_values("position")
+        query_data_grouped["ctr"] = query_data_grouped["ctr"].round(2)
         with st.expander(
             f"**{query}** — {int(qrow['page_count'])} pages | "
             f"{int(qrow['total_impressions']):,} imp | {int(qrow['total_clicks']):,} clicks"
         ):
             st.dataframe(
-                query_data[["page", "clicks", "impressions", "ctr", "position"]],
+                query_data_grouped[["page", "clicks", "impressions", "ctr", "position"]],
                 use_container_width=True,
                 hide_index=True,
             )

@@ -260,10 +260,13 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
         new_queries = pd.DataFrame()
 
     # ---- 🔄 Cannibalisation : requêtes avec 2+ pages différentes ----
+    # On normalise les URLs en supprimant les fragments (#...) car c'est la même page
     if not current.empty:
-        pages_per_query = current.groupby("query").agg(
-            page_count=("page", "nunique"),
-            pages=("page", lambda x: list(x.unique())),
+        cannibal_df = current.copy()
+        cannibal_df["page_clean"] = cannibal_df["page"].str.split("#").str[0]
+        pages_per_query = cannibal_df.groupby("query").agg(
+            page_count=("page_clean", "nunique"),
+            pages=("page_clean", lambda x: list(x.unique())),
             clicks=("clicks", "sum"),
             impressions=("impressions", "sum"),
             positions=("position", lambda x: list(x.round(1))),
