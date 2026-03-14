@@ -439,6 +439,33 @@ def push_to_supabase(supabase_config: dict, site_url: str, data: dict, analysis:
             print(f"    [SUPABASE] Erreur weekly_summary: {resp.status_code}")
 
 
+def fetch_sites_from_supabase(supabase_config: dict) -> list:
+    """
+    Récupère la liste des sites actifs depuis Supabase.
+    Retourne une liste d'URLs GSC (ex: ['https://avis-malin.fr/', ...]).
+    Permet de gérer les sites depuis le dashboard sans toucher au config.yaml.
+    """
+    url = supabase_config["url"]
+    key = supabase_config["key"]
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+    }
+    try:
+        resp = httpx.get(
+            f"{url}/rest/v1/sites",
+            headers=headers,
+            params={"select": "url", "active": "eq.true", "order": "name.asc"},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return [s["url"] for s in data]
+    except Exception as e:
+        print(f"  [SUPABASE] Impossible de charger les sites: {e}")
+    return []
+
+
 # ============================================================
 # 5. GÉNÉRATION DES RAPPORTS
 # ============================================================
@@ -631,6 +658,15 @@ def main():
     credentials_file = config["credentials_file"]
     token_file = config["token_file"]
     supabase_config = config.get("supabase")
+
+    # Charger les sites depuis Supabase (prioritaire sur config.yaml)
+    if supabase_config and not args.site:
+        supabase_sites = fetch_sites_from_supabase(supabase_config)
+        if supabase_sites:
+            sites = supabase_sites
+            print(f"[SUPABASE] {len(sites)} site(s) actif(s) chargé(s) depuis le dashboard.")
+        else:
+            print("[CONFIG] Sites chargés depuis config.yaml (Supabase indisponible).")
 
     # Filtrer sur un seul site si --site est utilisé
     if args.site:

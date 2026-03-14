@@ -361,6 +361,96 @@ def page_query_tracker():
         st.dataframe(evolution, use_container_width=True)
 
 
+def page_admin_sites():
+    """Gestion des sites trackés."""
+    st.header("Gestion des sites")
+    st.caption("Ajoutez, activez ou désactivez des sites directement depuis ce dashboard.")
+
+    # Charger les sites depuis Supabase
+    resp = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/sites",
+        headers=HEADERS,
+        params={"select": "*", "order": "name.asc"},
+        timeout=15.0,
+    )
+    sites_data = resp.json() if resp.status_code == 200 else []
+
+    # Afficher les sites existants
+    if sites_data:
+        st.subheader("Sites actuels")
+        for site in sites_data:
+            col1, col2, col3 = st.columns([3, 1, 1])
+            col1.markdown(f"**{site['name']}** — `{site['url']}`")
+            status = "Actif" if site["active"] else "Inactif"
+            col2.markdown(f"{'🟢' if site['active'] else '🔴'} {status}")
+
+            # Bouton activer/désactiver
+            btn_label = "Désactiver" if site["active"] else "Activer"
+            if col3.button(btn_label, key=f"toggle_{site['id']}"):
+                httpx.patch(
+                    f"{SUPABASE_URL}/rest/v1/sites",
+                    headers={**HEADERS, "Prefer": "return=minimal"},
+                    params={"id": f"eq.{site['id']}"},
+                    json={"active": not site["active"]},
+                    timeout=10.0,
+                )
+                st.rerun()
+        st.markdown("---")
+
+    # Formulaire d'ajout
+    st.subheader("Ajouter un site")
+    st.info(
+        "Le format doit correspondre exactement à celui de Google Search Console. "
+        "Lancez `python list_sites.py` pour voir les URLs exactes de votre compte."
+    )
+
+    with st.form("add_site"):
+        new_url = st.text_input("URL du site (ex: https://monsite.fr/)")
+        new_name = st.text_input("Nom court (ex: monsite.fr)")
+        submitted = st.form_submit_button("Ajouter")
+
+        if submitted and new_url and new_name:
+            # Vérifier que l'URL se termine par /
+            if not new_url.endswith("/"):
+                new_url += "/"
+            if not new_url.startswith("https://"):
+                new_url = f"https://{new_url}"
+
+            resp = httpx.post(
+                f"{SUPABASE_URL}/rest/v1/sites",
+                headers={**HEADERS, "Prefer": "return=minimal"},
+                json={"url": new_url, "name": new_name, "active": True},
+                timeout=10.0,
+            )
+            if resp.status_code in (200, 201):
+                st.success(f"Site {new_name} ajouté !")
+                st.rerun()
+            elif resp.status_code == 409:
+                st.error("Ce site existe déjà.")
+            else:
+                st.error(f"Erreur: {resp.status_code} — {resp.text}")
+
+    # Section suppression
+    if sites_data:
+        st.markdown("---")
+        st.subheader("Supprimer un site")
+        site_to_delete = st.selectbox(
+            "Site à supprimer",
+            options=sites_data,
+            format_func=lambda s: f"{s['name']} ({s['url']})",
+            key="delete_site",
+        )
+        if st.button("Supprimer", type="secondary"):
+            httpx.delete(
+                f"{SUPABASE_URL}/rest/v1/sites",
+                headers=HEADERS,
+                params={"id": f"eq.{site_to_delete['id']}"},
+                timeout=10.0,
+            )
+            st.success(f"Site {site_to_delete['name']} supprimé.")
+            st.rerun()
+
+
 def page_data_export():
     """Export des données brutes."""
     sites = get_sites()
@@ -407,6 +497,7 @@ page = st.sidebar.radio("Navigation", [
     "Détail par site",
     "Suivi de requête",
     "Export données",
+    "Gestion des sites",
 ])
 
 st.sidebar.markdown("---")
@@ -424,3 +515,5 @@ elif page == "Suivi de requête":
     page_query_tracker()
 elif page == "Export données":
     page_data_export()
+elif page == "Gestion des sites":
+    page_admin_sites()
