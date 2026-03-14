@@ -924,6 +924,12 @@ def main():
 
     # Générer les rapports
     print("\n" + "=" * 55)
+
+    if not all_results:
+        print("⚠️  Aucun site collecté. Pas de rapport à générer.")
+        print("   Vérifiez la liste des sites dans Supabase ou config.yaml.")
+        return
+
     print("📝 Génération des rapports...")
 
     # Rapport Excel

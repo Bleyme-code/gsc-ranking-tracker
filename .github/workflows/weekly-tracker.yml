@@ -57,8 +57,8 @@ jobs:
               'credentials_file': './credentials.json',
               'token_file': './token.json',
               'supabase': {
-                  'url': os.environ['SUPABASE_URL'],
-                  'key': os.environ['SUPABASE_KEY'],
+                  'url': os.environ['SUPABASE_URL'].strip(),
+                  'key': os.environ['SUPABASE_KEY'].strip(),
               },
           }
           with open('config.yaml', 'w') as f:
