@@ -12,3 +12,6 @@ rapports/
 __pycache__/
 *.pyc
 .venv/
+
+# Claude
+.claude/

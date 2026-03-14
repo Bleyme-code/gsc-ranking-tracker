@@ -58,6 +58,12 @@ def get_gsc_service(credentials_file: str, token_file: str):
         if creds and creds.expired and creds.refresh_token:
             print("[AUTH] Refresh du token...")
             creds.refresh(Request())
+        elif os.environ.get("CI") == "true":
+            # CI/headless mode: no browser available, cannot run interactive OAuth
+            print("[ERREUR] Token invalide ou expiré en mode CI.")
+            print("         Impossible de lancer le flow OAuth2 sans navigateur.")
+            print("         Régénérez token.json localement et mettez à jour le secret GitHub GSC_TOKEN_JSON.")
+            sys.exit(1)
         else:
             if not os.path.exists(credentials_file):
                 print(f"[ERREUR] Fichier credentials introuvable : {credentials_file}")
@@ -181,6 +187,8 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
             "low_ctr": pd.DataFrame(),
             "new_queries": pd.DataFrame(),
             "cannibalization": pd.DataFrame(),
+            "trends_up": pd.DataFrame(),
+            "trends_down": pd.DataFrame(),
         }
 
     # ---- Merge semaine N et N-1 pour comparer ----
@@ -277,6 +285,98 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
     else:
         cannibalization = pd.DataFrame()
 
+    # ---- 📈📉 Tendances multi-semaines (3+ semaines consécutives) ----
+    trends_up = pd.DataFrame()
+    trends_down = pd.DataFrame()
+
+    # On a besoin d'au moins 3 semaines pour détecter une tendance
+    weeks_available = sorted([w for w in data.keys() if not data[w].empty])
+    trend_weeks = [w for w in range(4) if w in weeks_available]
+
+    if len(trend_weeks) >= 3 and not current.empty:
+        # Construire un dict query+page -> {week_idx: position}
+        position_history = {}
+        for w in trend_weeks:
+            df_w = data[w]
+            for _, r in df_w.iterrows():
+                key = (r["query"], r["page"])
+                if key not in position_history:
+                    position_history[key] = {}
+                position_history[key][w] = r["position"]
+
+        trend_records = []
+        for (query, page), positions in position_history.items():
+            # Only consider queries present in week 0 (current)
+            if 0 not in positions:
+                continue
+
+            # Build ordered position list from oldest to newest
+            ordered_weeks = sorted([w for w in trend_weeks if w in positions], reverse=True)
+            pos_sequence = [(w, positions[w]) for w in ordered_weeks]
+
+            if len(pos_sequence) < 3:
+                continue
+
+            # Count consecutive improvements/drops from oldest to newest
+            consecutive_improving = 0
+            consecutive_worsening = 0
+
+            for i in range(1, len(pos_sequence)):
+                prev_pos = pos_sequence[i - 1][1]
+                curr_pos = pos_sequence[i][1]
+                if curr_pos < prev_pos:  # position number decreased = improved
+                    consecutive_improving += 1
+                    consecutive_worsening = 0
+                elif curr_pos > prev_pos:  # position number increased = worsened
+                    consecutive_worsening += 1
+                    consecutive_improving = 0
+                else:
+                    consecutive_improving = 0
+                    consecutive_worsening = 0
+
+            oldest_week = max(trend_weeks)
+            position_oldest = positions.get(oldest_week)
+            position_current = positions[0]
+
+            # Get current week data for impressions/clicks
+            curr_row = current[(current["query"] == query) & (current["page"] == page)]
+            impressions_val = int(curr_row["impressions"].iloc[0]) if not curr_row.empty else 0
+            clicks_val = int(curr_row["clicks"].iloc[0]) if not curr_row.empty else 0
+
+            total_change = round(position_current - position_oldest, 1) if position_oldest is not None else None
+
+            if consecutive_improving >= 3:
+                trend_records.append({
+                    "query": query,
+                    "page": page,
+                    "position": round(position_current, 1),
+                    "position_4w_ago": round(position_oldest, 1) if position_oldest else None,
+                    "total_change": total_change,
+                    "weeks_trending": consecutive_improving,
+                    "impressions": impressions_val,
+                    "clicks": clicks_val,
+                    "direction": "up",
+                })
+            elif consecutive_worsening >= 3:
+                trend_records.append({
+                    "query": query,
+                    "page": page,
+                    "position": round(position_current, 1),
+                    "position_4w_ago": round(position_oldest, 1) if position_oldest else None,
+                    "total_change": total_change,
+                    "weeks_trending": consecutive_worsening,
+                    "impressions": impressions_val,
+                    "clicks": clicks_val,
+                    "direction": "down",
+                })
+
+        if trend_records:
+            trends_df = pd.DataFrame(trend_records)
+            trends_up = trends_df[trends_df["direction"] == "up"].drop(columns=["direction"]).copy()
+            trends_up = trends_up.sort_values("total_change")  # most negative = biggest improvement
+            trends_down = trends_df[trends_df["direction"] == "down"].drop(columns=["direction"]).copy()
+            trends_down = trends_down.sort_values("total_change", ascending=False)  # most positive = biggest drop
+
     return {
         "current": merged,
         "progressions": progressions,
@@ -285,6 +385,8 @@ def analyze_site(data: dict, thresholds: dict) -> dict:
         "low_ctr": low_ctr,
         "new_queries": new_queries,
         "cannibalization": cannibalization,
+        "trends_up": trends_up,
+        "trends_down": trends_down,
     }
 
 
@@ -336,6 +438,14 @@ def init_db(db_path: str):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_site ON weekly_data(site, week_start)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_site ON weekly_summary(site, week_start)")
+
+    # Ajouter les colonnes trends_up et trends_down si elles n'existent pas encore
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(weekly_summary)").fetchall()}
+    if "trends_up" not in existing_cols:
+        conn.execute("ALTER TABLE weekly_summary ADD COLUMN trends_up INTEGER DEFAULT 0")
+    if "trends_down" not in existing_cols:
+        conn.execute("ALTER TABLE weekly_summary ADD COLUMN trends_down INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
@@ -377,8 +487,9 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
         conn.execute("""
             INSERT OR REPLACE INTO weekly_summary
             (site, week_start, week_end, total_queries, total_clicks, total_impressions,
-             avg_position, progressions, drops, quickwins, low_ctr, new_queries, cannibalization, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             avg_position, progressions, drops, quickwins, low_ctr, new_queries, cannibalization,
+             trends_up, trends_down, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             short_name, start, end,
             len(df),
@@ -391,6 +502,8 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
             len(analysis["low_ctr"]) if week_idx == 0 else 0,
             len(analysis["new_queries"]) if week_idx == 0 else 0,
             len(analysis["cannibalization"]) if week_idx == 0 else 0,
+            len(analysis["trends_up"]) if week_idx == 0 else 0,
+            len(analysis["trends_down"]) if week_idx == 0 else 0,
             now,
         ))
 
@@ -468,6 +581,8 @@ def push_to_supabase(supabase_config: dict, site_url: str, data: dict, analysis:
             "low_ctr": len(analysis["low_ctr"]) if week_idx == 0 else 0,
             "new_queries": len(analysis["new_queries"]) if week_idx == 0 else 0,
             "cannibalization": len(analysis["cannibalization"]) if week_idx == 0 else 0,
+            "trends_up": len(analysis["trends_up"]) if week_idx == 0 else 0,
+            "trends_down": len(analysis["trends_down"]) if week_idx == 0 else 0,
             "collected_at": now,
         })
 
@@ -550,6 +665,8 @@ def generate_excel(all_results: dict, output_dir: str) -> str:
                 "Mauvais CTR": analysis["low_ctr"],
                 "Nouvelles": analysis["new_queries"],
                 "Cannibalisation": analysis["cannibalization"],
+                "Tendance Hausse": analysis["trends_up"],
+                "Tendance Baisse": analysis["trends_down"],
             }
             for seg_name, seg_df in segments.items():
                 seg_sheet = f"{short_name[:20]}_{seg_name}".replace("/", "")[:31]
@@ -568,6 +685,8 @@ def generate_excel(all_results: dict, output_dir: str) -> str:
                 "Mauvais CTR": len(analysis["low_ctr"]),
                 "Nouvelles requêtes": len(analysis["new_queries"]),
                 "Cannibalisation": len(analysis["cannibalization"]),
+                "Tendances hausse": len(analysis["trends_up"]),
+                "Tendances baisse": len(analysis["trends_down"]),
             })
 
         # --- Onglet Résumé global ---
@@ -677,6 +796,30 @@ def generate_text_summary(all_results: dict) -> str:
                              f" | {row['impressions']} imp | {row['clicks']} clicks")
             if len(cannibal) > 5:
                 lines.append(f"     ... et {len(cannibal) - 5} autres")
+            lines.append("")
+
+        # Tendances haussières (3+ semaines d'amélioration)
+        trends_up = analysis.get("trends_up", pd.DataFrame())
+        if not trends_up.empty:
+            lines.append(f"  📈 Tendances haussières (3+ sem.) : {len(trends_up)}")
+            for _, row in trends_up.head(5).iterrows():
+                p4w = f"{row['position_4w_ago']:.0f}" if pd.notna(row.get("position_4w_ago")) else "?"
+                lines.append(f"     ↗ {row['query'][:50]} : {row['position']:.0f}"
+                             f" (était {p4w}, {row['total_change']:+.1f} sur {int(row['weeks_trending'])} sem.)")
+            if len(trends_up) > 5:
+                lines.append(f"     ... et {len(trends_up) - 5} autres")
+            lines.append("")
+
+        # Tendances baissières (3+ semaines de déclin)
+        trends_down = analysis.get("trends_down", pd.DataFrame())
+        if not trends_down.empty:
+            lines.append(f"  📉 Tendances baissières (3+ sem.) : {len(trends_down)}")
+            for _, row in trends_down.head(5).iterrows():
+                p4w = f"{row['position_4w_ago']:.0f}" if pd.notna(row.get("position_4w_ago")) else "?"
+                lines.append(f"     ↘ {row['query'][:50]} : {row['position']:.0f}"
+                             f" (était {p4w}, {row['total_change']:+.1f} sur {int(row['weeks_trending'])} sem.)")
+            if len(trends_down) > 5:
+                lines.append(f"     ... et {len(trends_down) - 5} autres")
             lines.append("")
 
         lines.append("")

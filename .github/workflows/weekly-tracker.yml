@@ -1,0 +1,89 @@
+# =============================================================================
+# GSC Ranking Tracker - Weekly Automated Run
+# =============================================================================
+# Runs tracker.py every Monday at 8am UTC via GitHub Actions.
+#
+# Required GitHub Secrets:
+#   GSC_TOKEN_JSON        - Contents of token.json (OAuth2 refresh token)
+#   GSC_CREDENTIALS_JSON  - Contents of credentials.json (OAuth2 client config)
+#   SUPABASE_URL          - Supabase project URL (e.g. https://xxx.supabase.co)
+#   SUPABASE_KEY          - Supabase anon/service key
+# =============================================================================
+
+name: Weekly GSC Tracker
+
+on:
+  schedule:
+    # Every Monday at 8:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create config.yaml from secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -c "
+          import yaml, os
+          config = {
+              'sites': [],
+              'weeks_history': 2,
+              'thresholds': {
+                  'position_drop': 3,
+                  'position_gain': 3,
+                  'quickwin_pos_min': 4,
+                  'quickwin_pos_max': 12,
+                  'quickwin_impressions_min': 100,
+                  'low_ctr_impressions_min': 200,
+                  'low_ctr_threshold': 3.0,
+              },
+              'output_dir': './rapports',
+              'credentials_file': './credentials.json',
+              'token_file': './token.json',
+              'supabase': {
+                  'url': os.environ['SUPABASE_URL'],
+                  'key': os.environ['SUPABASE_KEY'],
+              },
+          }
+          with open('config.yaml', 'w') as f:
+              yaml.dump(config, f, default_flow_style=False)
+          "
+
+      - name: Create token.json from secret
+        env:
+          GSC_TOKEN_JSON: ${{ secrets.GSC_TOKEN_JSON }}
+        run: printenv GSC_TOKEN_JSON > token.json
+
+      - name: Create credentials.json from secret
+        env:
+          GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
+        run: printenv GSC_CREDENTIALS_JSON > credentials.json
+
+      - name: Run tracker
+        env:
+          CI: "true"
+        run: python tracker.py --config config.yaml
+
+      - name: Upload reports as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsc-reports-${{ github.run_number }}
+          path: rapports/
+          retention-days: 30

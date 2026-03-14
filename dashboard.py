@@ -188,12 +188,17 @@ def page_overview():
                 delta_clicks = int(latest['total_clicks'] - prev['total_clicks'])
                 cols[1].caption(f"{'↗' if delta_clicks >= 0 else '↘'} {delta_clicks:+,}")
 
-            alert_cols = st.columns(5)
+            has_trends = "trends_up" in latest.index and "trends_down" in latest.index
+            alert_col_count = 7 if has_trends else 5
+            alert_cols = st.columns(alert_col_count)
             alert_cols[0].metric("🟢 Progress.", int(latest["progressions"]))
             alert_cols[1].metric("🔴 Chutes", int(latest["drops"]))
             alert_cols[2].metric("🎯 Quick Wins", int(latest["quickwins"]))
             alert_cols[3].metric("👁️ Mauvais CTR", int(latest["low_ctr"]))
             alert_cols[4].metric("🆕 Nouvelles", int(latest["new_queries"]))
+            if has_trends:
+                alert_cols[5].metric("📈 Tendance +", int(latest["trends_up"]))
+                alert_cols[6].metric("📉 Tendance -", int(latest["trends_down"]))
 
     # Graphiques comparatifs — toggle semaine/mois
     time_view = st.radio("Granularité", ["Par semaine", "Par mois"], horizontal=True, key="overview_time_view")
@@ -629,6 +634,213 @@ def page_cannibalization():
         st.caption(f"Affichage limité aux 50 premières requêtes sur {len(display_queries)}.")
 
 
+def color_trend_change(val):
+    """Colore les variations de tendance (vert = amélioration, rouge = déclin)."""
+    if pd.isna(val):
+        return ""
+    if val < 0:
+        return "color: #22c55e; font-weight: bold"
+    elif val > 0:
+        return "color: #ef4444; font-weight: bold"
+    return ""
+
+
+@st.cache_data(ttl=300)
+def get_multi_week_data(site: str, num_weeks: int = 4) -> dict:
+    """Récupère les données des N dernières semaines pour un site."""
+    weeks = get_available_weeks(site)
+    result = {}
+    for i, week in enumerate(weeks[:num_weeks]):
+        df = get_week_data(site, week, limit=5000)
+        if not df.empty:
+            result[i] = {"week_start": week, "data": df}
+    return result
+
+
+def compute_trends(multi_week: dict, min_impressions: int = 50) -> tuple:
+    """
+    Calcule les tendances haussières et baissières sur 3+ semaines consécutives.
+    Retourne (trends_up_df, trends_down_df).
+    """
+    if len(multi_week) < 3:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Build position history: (query, page) -> {week_idx: position}
+    position_history = {}
+    week_indices = sorted(multi_week.keys())
+
+    for w_idx in week_indices:
+        df = multi_week[w_idx]["data"]
+        for _, row in df.iterrows():
+            key = (row["query"], row["page"])
+            if key not in position_history:
+                position_history[key] = {}
+            position_history[key][w_idx] = row["position"]
+
+    # Current week data for impressions/clicks
+    current_df = multi_week[0]["data"] if 0 in multi_week else pd.DataFrame()
+
+    trend_records = []
+    for (query, page), positions in position_history.items():
+        if 0 not in positions:
+            continue
+
+        # Ordered from oldest to newest
+        ordered_weeks = sorted([w for w in week_indices if w in positions], reverse=True)
+        pos_sequence = [(w, positions[w]) for w in ordered_weeks]
+
+        if len(pos_sequence) < 3:
+            continue
+
+        consecutive_improving = 0
+        consecutive_worsening = 0
+
+        for i in range(1, len(pos_sequence)):
+            prev_pos = pos_sequence[i - 1][1]
+            curr_pos = pos_sequence[i][1]
+            if curr_pos < prev_pos:
+                consecutive_improving += 1
+                consecutive_worsening = 0
+            elif curr_pos > prev_pos:
+                consecutive_worsening += 1
+                consecutive_improving = 0
+            else:
+                consecutive_improving = 0
+                consecutive_worsening = 0
+
+        oldest_week = max(week_indices)
+        position_oldest = positions.get(oldest_week)
+        position_current = positions[0]
+
+        # Get impressions/clicks from current week
+        curr_row = current_df[(current_df["query"] == query) & (current_df["page"] == page)]
+        impressions = int(curr_row["impressions"].iloc[0]) if not curr_row.empty else 0
+        clicks = int(curr_row["clicks"].iloc[0]) if not curr_row.empty else 0
+
+        if impressions < min_impressions:
+            continue
+
+        total_change = round(position_current - position_oldest, 1) if position_oldest is not None else None
+
+        if consecutive_improving >= 3:
+            trend_records.append({
+                "query": query,
+                "page": page,
+                "position": round(position_current, 1),
+                "position_4w_ago": round(position_oldest, 1) if position_oldest else None,
+                "total_change": total_change,
+                "weeks_trending": consecutive_improving,
+                "impressions": impressions,
+                "clicks": clicks,
+                "direction": "up",
+            })
+        elif consecutive_worsening >= 3:
+            trend_records.append({
+                "query": query,
+                "page": page,
+                "position": round(position_current, 1),
+                "position_4w_ago": round(position_oldest, 1) if position_oldest else None,
+                "total_change": total_change,
+                "weeks_trending": consecutive_worsening,
+                "impressions": impressions,
+                "clicks": clicks,
+                "direction": "down",
+            })
+
+    if not trend_records:
+        return pd.DataFrame(), pd.DataFrame()
+
+    trends_df = pd.DataFrame(trend_records)
+    trends_up = trends_df[trends_df["direction"] == "up"].drop(columns=["direction"]).copy()
+    trends_up = trends_up.sort_values("total_change")
+    trends_down = trends_df[trends_df["direction"] == "down"].drop(columns=["direction"]).copy()
+    trends_down = trends_down.sort_values("total_change", ascending=False)
+
+    return trends_up, trends_down
+
+
+def page_trends():
+    """Page de détection des tendances multi-semaines."""
+    st.header("Tendances")
+    st.caption("Requêtes dont la position s'améliore ou se dégrade de manière continue sur 3+ semaines consécutives.")
+
+    sites = get_sites()
+    if not sites:
+        st.warning("Aucune donnée.")
+        return
+
+    site = st.selectbox("Site", sites, key="trends_site")
+    weeks = get_available_weeks(site)
+
+    if len(weeks) < 3:
+        st.warning("Il faut au moins 3 semaines de données pour détecter des tendances.")
+        return
+
+    min_impressions = st.number_input(
+        "Impressions minimum", min_value=0, value=50, step=10, key="trends_min_imp",
+        help="Filtrer les requêtes ayant au moins ce nombre d'impressions sur la semaine en cours."
+    )
+
+    multi_week = get_multi_week_data(site, num_weeks=4)
+    if len(multi_week) < 3:
+        st.warning("Pas assez de semaines avec des données pour ce site.")
+        return
+
+    weeks_labels = [multi_week[w]["week_start"] for w in sorted(multi_week.keys())]
+    st.info(f"Analyse sur {len(multi_week)} semaines : {weeks_labels[-1]} ... {weeks_labels[0]}")
+
+    trends_up, trends_down = compute_trends(multi_week, min_impressions=min_impressions)
+
+    # Summary metrics
+    cols = st.columns(2)
+    cols[0].metric("📈 Requêtes en hausse", len(trends_up))
+    cols[1].metric("📉 Requêtes en baisse", len(trends_down))
+
+    st.markdown("---")
+
+    display_cols = ["query", "page", "position", "position_4w_ago", "total_change", "weeks_trending", "impressions", "clicks"]
+
+    # Tendances haussières
+    st.subheader("📈 Tendances haussières")
+    st.caption("Requêtes dont la position s'améliore depuis 3+ semaines consécutives.")
+    if trends_up.empty:
+        st.info("Aucune tendance haussière détectée.")
+    else:
+        search_up = st.text_input("Filtrer les requêtes en hausse", "", key="trends_up_search")
+        display_up = trends_up.copy()
+        if search_up:
+            display_up = display_up[display_up["query"].str.contains(search_up, case=False, na=False)]
+
+        available_up = [c for c in display_cols if c in display_up.columns]
+        st.dataframe(
+            display_up[available_up].head(200).style.map(color_trend_change, subset=["total_change"]),
+            use_container_width=True,
+            height=min(400, 35 * len(display_up) + 40),
+        )
+        st.caption(f"{len(display_up)} requêtes en tendance haussière")
+
+    st.markdown("---")
+
+    # Tendances baissières
+    st.subheader("📉 Tendances baissières")
+    st.caption("Requêtes dont la position se dégrade depuis 3+ semaines consécutives.")
+    if trends_down.empty:
+        st.info("Aucune tendance baissière détectée.")
+    else:
+        search_down = st.text_input("Filtrer les requêtes en baisse", "", key="trends_down_search")
+        display_down = trends_down.copy()
+        if search_down:
+            display_down = display_down[display_down["query"].str.contains(search_down, case=False, na=False)]
+
+        available_down = [c for c in display_cols if c in display_down.columns]
+        st.dataframe(
+            display_down[available_down].head(200).style.map(color_trend_change, subset=["total_change"]),
+            use_container_width=True,
+            height=min(400, 35 * len(display_down) + 40),
+        )
+        st.caption(f"{len(display_down)} requêtes en tendance baissière")
+
+
 def page_data_export():
     """Export des données brutes."""
     sites = get_sites()
@@ -674,6 +886,7 @@ page = st.sidebar.radio("Navigation", [
     "Vue globale",
     "Détail par site",
     "Suivi de requête",
+    "Tendances",
     "Cannibalisation",
     "Export données",
     "Gestion des sites",
@@ -692,6 +905,8 @@ elif page == "Détail par site":
     page_site_detail()
 elif page == "Suivi de requête":
     page_query_tracker()
+elif page == "Tendances":
+    page_trends()
 elif page == "Cannibalisation":
     page_cannibalization()
 elif page == "Export données":
