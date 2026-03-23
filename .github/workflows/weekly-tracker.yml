@@ -66,14 +66,10 @@ jobs:
           "
 
       - name: Create token.json from secret
-        env:
-          GSC_TOKEN_JSON: ${{ secrets.GSC_TOKEN_JSON }}
-        run: printenv GSC_TOKEN_JSON > token.json
+        run: echo '${{ secrets.GSC_TOKEN_JSON }}' > token.json
 
       - name: Create credentials.json from secret
-        env:
-          GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
-        run: printenv GSC_CREDENTIALS_JSON > credentials.json
+        run: echo '${{ secrets.GSC_CREDENTIALS_JSON }}' > credentials.json
 
       - name: Run tracker
         env:

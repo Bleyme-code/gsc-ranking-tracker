@@ -7,9 +7,19 @@ Déployable sur Streamlit Community Cloud.
 Usage local :  streamlit run dashboard.py
 """
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
 import httpx
 import pandas as pd
 import streamlit as st
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
 
 # ============================================================
 # CONFIGURATION
@@ -30,6 +40,88 @@ HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
 }
+
+# GSC OAuth
+GSC_SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
+TOKEN_FILE = Path(__file__).parent / "token.json"
+
+
+def get_gsc_connection_status():
+    """Vérifie si on a un token GSC valide. Retourne (connected, creds)."""
+    if not TOKEN_FILE.exists():
+        return False, None
+    try:
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), GSC_SCOPES)
+        if creds and creds.valid:
+            return True, creds
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            TOKEN_FILE.write_text(creds.to_json())
+            return True, creds
+    except Exception:
+        pass
+    return False, None
+
+
+def sync_gsc_sites(creds):
+    """Récupère les sites GSC et les synchronise dans Supabase. Retourne (new_count, all_sites)."""
+    service = build("searchconsole", "v1", credentials=creds)
+    response = service.sites().list().execute()
+    gsc_sites = response.get("siteEntry", [])
+
+    if not gsc_sites:
+        return 0, []
+
+    # Sites déjà dans Supabase
+    resp = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/sites",
+        headers=HEADERS,
+        params={"select": "url"},
+        timeout=10.0,
+    )
+    existing_urls = set()
+    if resp.status_code == 200:
+        existing_urls = {s["url"] for s in resp.json()}
+
+    new_count = 0
+    all_sites = []
+    for site in gsc_sites:
+        site_url = site["siteUrl"]
+        if not site_url.endswith("/") and not site_url.startswith("sc-domain:"):
+            site_url += "/"
+        name = site_url.replace("sc-domain:", "").replace("https://", "").replace("http://", "").rstrip("/")
+        all_sites.append({"url": site_url, "name": name})
+
+        if site_url not in existing_urls:
+            resp = httpx.post(
+                f"{SUPABASE_URL}/rest/v1/sites",
+                headers={**HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+                json={"url": site_url, "name": name, "active": False},
+                timeout=10.0,
+            )
+            if resp.status_code in (200, 201):
+                new_count += 1
+
+    return new_count, all_sites
+
+
+def run_tracker_collect(site: str | None = None):
+    """Lance tracker.py pour collecter les données. Si site est fourni, ne collecte que ce site."""
+    tracker_path = Path(__file__).parent / "tracker.py"
+    cmd = [sys.executable, str(tracker_path)]
+    if site:
+        cmd.extend(["--site", site])
+    result = subprocess.run(
+        cmd,
+        cwd=str(tracker_path.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,  # 5 min max
+    )
+    return result.returncode, result.stdout, result.stderr
 
 
 # ============================================================
@@ -63,9 +155,22 @@ def get_all_summaries() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def get_sites() -> list:
-    """Liste des sites disponibles."""
+    """Liste des sites disponibles (données existantes + sites actifs)."""
+    sites = set()
     df = get_all_summaries()
-    return sorted(df["site"].unique().tolist()) if not df.empty else []
+    if not df.empty:
+        sites.update(df["site"].unique().tolist())
+    # Ajouter les sites actifs de la table sites (même sans données)
+    resp = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/sites",
+        headers=HEADERS,
+        params={"select": "name", "active": "eq.true"},
+        timeout=10.0,
+    )
+    if resp.status_code == 200:
+        for s in resp.json():
+            sites.add(s["name"])
+    return sorted(sites)
 
 
 @st.cache_data(ttl=300)
@@ -163,11 +268,26 @@ def page_overview():
     st.header("Vue globale")
 
     all_summaries = get_all_summaries()
-    if all_summaries.empty:
-        st.warning("Aucune donnée. Lancez `python tracker.py` pour collecter les données.")
+    all_sites = get_sites()
+
+    if not all_sites:
+        st.warning("Aucun site. Connectez votre compte GSC depuis **Gestion des sites**.")
         return
 
-    sites = sorted(all_summaries["site"].unique())
+    sites_with_data = set(all_summaries["site"].unique()) if not all_summaries.empty else set()
+
+    # Sites actifs sans données
+    sites_pending = [s for s in all_sites if s not in sites_with_data]
+    if sites_pending:
+        st.info(
+            f"**{len(sites_pending)} site(s) en attente de collecte** : "
+            + ", ".join(sites_pending)
+            + "\n\nActivez-les depuis **Gestion des sites** pour lancer la collecte automatiquement."
+        )
+
+    sites = sorted(sites_with_data)
+    if not sites:
+        return
 
     # KPIs par site (dernière semaine)
     for site in sites:
@@ -435,9 +555,103 @@ def page_query_tracker():
 def page_admin_sites():
     """Gestion des sites trackés."""
     st.header("Gestion des sites")
-    st.caption("Ajoutez, activez ou désactivez des sites directement depuis ce dashboard.")
 
-    # Charger les sites depuis Supabase
+    # ── Connexion GSC ──────────────────────────────────────────
+    st.subheader("🔗 Connexion Google Search Console")
+
+    connected, creds = get_gsc_connection_status()
+
+    if connected:
+        st.success("Connecté à Google Search Console")
+        col_sync, col_collect, col_disconnect = st.columns(3)
+        if col_sync.button("🔄 Synchroniser les sites"):
+            with st.spinner("Synchronisation en cours..."):
+                new_count, all_sites = sync_gsc_sites(creds)
+            if new_count > 0:
+                st.success(f"{new_count} nouveau(x) site(s) importé(s) sur {len(all_sites)} trouvés !")
+            else:
+                st.info(f"Tous les {len(all_sites)} sites sont déjà synchronisés.")
+            st.cache_data.clear()
+            st.rerun()
+        if col_collect.button("🚀 Collecter les données"):
+            with st.spinner("Collecte en cours... (cela peut prendre quelques minutes)"):
+                returncode, stdout, stderr = run_tracker_collect()
+            if returncode == 0:
+                st.success("Collecte terminée !")
+                with st.expander("Détails"):
+                    st.code(stdout)
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error("Erreur lors de la collecte.")
+                with st.expander("Détails de l'erreur"):
+                    st.code(stderr or stdout)
+        if col_disconnect.button("🔌 Déconnecter"):
+            TOKEN_FILE.unlink(missing_ok=True)
+            st.cache_data.clear()
+            st.rerun()
+    else:
+        if not CREDENTIALS_FILE.exists():
+            st.error(
+                "Fichier `credentials.json` introuvable dans le dossier du projet.\n\n"
+                "Créez un projet Google Cloud, activez l'API Search Console, "
+                "et téléchargez les identifiants OAuth."
+            )
+        else:
+            st.info("Connectez votre compte Google pour importer automatiquement vos sites GSC.")
+
+            if st.button("Se connecter à Google Search Console"):
+                flow = Flow.from_client_secrets_file(
+                    str(CREDENTIALS_FILE),
+                    scopes=GSC_SCOPES,
+                    redirect_uri="http://localhost",
+                )
+                auth_url, state = flow.authorization_url(
+                    access_type="offline",
+                    prompt="consent",
+                )
+                st.session_state["gsc_auth_url"] = auth_url
+
+            if st.session_state.get("gsc_auth_url"):
+                st.markdown("**Étapes :**")
+                st.markdown(f"1. [Cliquez ici pour autoriser l'accès GSC]({st.session_state['gsc_auth_url']})")
+                st.markdown("2. Autorisez l'accès dans la fenêtre Google")
+                st.markdown("3. Vous serez redirigé vers une page qui **ne charge pas** — c'est normal")
+                st.markdown("4. Copiez l'**URL complète** depuis la barre d'adresse et collez-la ci-dessous :")
+
+                redirect_url = st.text_input(
+                    "URL de redirection (commençant par http://localhost?...)",
+                    key="gsc_redirect_url",
+                )
+                if redirect_url and "code=" in redirect_url:
+                    try:
+                        parsed = urlparse(redirect_url)
+                        code = parse_qs(parsed.query)["code"][0]
+
+                        flow = Flow.from_client_secrets_file(
+                            str(CREDENTIALS_FILE),
+                            scopes=GSC_SCOPES,
+                            redirect_uri="http://localhost",
+                        )
+                        flow.fetch_token(code=code)
+                        new_creds = flow.credentials
+                        TOKEN_FILE.write_text(new_creds.to_json())
+
+                        # Auto-sync des sites
+                        new_count, all_sites = sync_gsc_sites(new_creds)
+                        st.success(
+                            f"Connecté ! {len(all_sites)} site(s) trouvé(s) dans GSC, "
+                            f"{new_count} nouveau(x) importé(s)."
+                        )
+                        st.session_state.pop("gsc_auth_url", None)
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erreur d'authentification : {e}")
+
+    st.markdown("---")
+
+    # ── Liste des sites ────────────────────────────────────────
     resp = httpx.get(
         f"{SUPABASE_URL}/rest/v1/sites",
         headers=HEADERS,
@@ -446,34 +660,80 @@ def page_admin_sites():
     )
     sites_data = resp.json() if resp.status_code == 200 else []
 
-    # Afficher les sites existants
-    if sites_data:
-        st.subheader("Sites actuels")
-        for site in sites_data:
-            col1, col2, col3 = st.columns([3, 1, 1])
-            col1.markdown(f"**{site['name']}** — `{site['url']}`")
-            status = "Actif" if site["active"] else "Inactif"
-            col2.markdown(f"{'🟢' if site['active'] else '🔴'} {status}")
+    all_summaries = get_all_summaries()
+    sites_with_data = set()
+    if not all_summaries.empty:
+        sites_with_data = set(all_summaries["site"].unique())
 
-            # Bouton activer/désactiver
-            btn_label = "Désactiver" if site["active"] else "Activer"
-            if col3.button(btn_label, key=f"toggle_{site['id']}"):
+    active_sites = [s for s in sites_data if s["active"]]
+    inactive_sites = [s for s in sites_data if not s["active"]]
+
+    if active_sites:
+        st.subheader(f"🟢 Sites actifs ({len(active_sites)})")
+        for site in active_sites:
+            short_name = site["url"].replace("sc-domain:", "").replace("https://", "").replace("http://", "").rstrip("/")
+            has_data = short_name in sites_with_data
+            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+            col1.markdown(f"**{site['name']}** — `{site['url']}`")
+            col2.markdown("📊 Données" if has_data else "⏳ En attente")
+            if col3.button("Désactiver", key=f"deactivate_{site['id']}"):
                 httpx.patch(
                     f"{SUPABASE_URL}/rest/v1/sites",
                     headers={**HEADERS, "Prefer": "return=minimal"},
                     params={"id": f"eq.{site['id']}"},
-                    json={"active": not site["active"]},
+                    json={"active": False},
                     timeout=10.0,
                 )
+                st.cache_data.clear()
+                st.rerun()
+            if col4.button("🗑️", key=f"del_{site['id']}"):
+                httpx.delete(
+                    f"{SUPABASE_URL}/rest/v1/sites",
+                    headers=HEADERS,
+                    params={"id": f"eq.{site['id']}"},
+                    timeout=10.0,
+                )
+                st.cache_data.clear()
                 st.rerun()
         st.markdown("---")
 
-    # Formulaire d'ajout
-    st.subheader("Ajouter un site")
-    st.info(
-        "Le format doit correspondre exactement à celui de Google Search Console. "
-        "Lancez `python list_sites.py` pour voir les URLs exactes de votre compte."
-    )
+    if inactive_sites:
+        st.subheader(f"🔴 Sites inactifs ({len(inactive_sites)})")
+        st.caption("Ces sites ne sont pas collectés. Activez-les pour les inclure dans le prochain tracking.")
+        for site in inactive_sites:
+            col1, col2, col3 = st.columns([3, 1, 1])
+            col1.markdown(f"**{site['name']}** — `{site['url']}`")
+            if col2.button("Activer", key=f"activate_{site['id']}"):
+                httpx.patch(
+                    f"{SUPABASE_URL}/rest/v1/sites",
+                    headers={**HEADERS, "Prefer": "return=minimal"},
+                    params={"id": f"eq.{site['id']}"},
+                    json={"active": True},
+                    timeout=10.0,
+                )
+                # Collecter les données immédiatement pour ce site
+                with st.spinner(f"Collecte des données pour {site['name']}..."):
+                    returncode, stdout, stderr = run_tracker_collect(site['name'])
+                if returncode == 0:
+                    st.success(f"Site **{site['name']}** activé et données collectées !")
+                else:
+                    st.warning(f"Site activé mais erreur lors de la collecte. Détails : {stderr or stdout}")
+                st.cache_data.clear()
+                st.rerun()
+            if col3.button("🗑️", key=f"del_inactive_{site['id']}"):
+                httpx.delete(
+                    f"{SUPABASE_URL}/rest/v1/sites",
+                    headers=HEADERS,
+                    params={"id": f"eq.{site['id']}"},
+                    timeout=10.0,
+                )
+                st.cache_data.clear()
+                st.rerun()
+        st.markdown("---")
+
+    # ── Ajout manuel ───────────────────────────────────────────
+    st.subheader("Ajouter un site manuellement")
+    st.caption("Le format doit correspondre exactement à celui de Google Search Console (ex: `https://monsite.fr/`).")
 
     with st.form("add_site"):
         new_url = st.text_input("URL du site (ex: https://monsite.fr/)")
@@ -481,45 +741,36 @@ def page_admin_sites():
         submitted = st.form_submit_button("Ajouter")
 
         if submitted and new_url and new_name:
-            # Vérifier que l'URL se termine par /
-            if not new_url.endswith("/"):
-                new_url += "/"
-            if not new_url.startswith("https://"):
+            new_url = new_url.strip()
+            if new_url.startswith("https://http://") or new_url.startswith("https://https://"):
+                new_url = "https://" + new_url.split("://", 2)[-1]
+            elif new_url.startswith("http://http://") or new_url.startswith("http://https://"):
+                new_url = "https://" + new_url.split("://", 2)[-1]
+            if not new_url.startswith(("https://", "http://", "sc-domain:")):
                 new_url = f"https://{new_url}"
+            if not new_url.endswith("/") and not new_url.startswith("sc-domain:"):
+                new_url += "/"
 
             resp = httpx.post(
                 f"{SUPABASE_URL}/rest/v1/sites",
                 headers={**HEADERS, "Prefer": "return=minimal"},
-                json={"url": new_url, "name": new_name, "active": True},
+                json={"url": new_url, "name": new_name.strip(), "active": True},
                 timeout=10.0,
             )
             if resp.status_code in (200, 201):
-                st.success(f"Site {new_name} ajouté !")
+                # Collecter les données immédiatement
+                with st.spinner(f"Collecte des données pour {new_name.strip()}..."):
+                    returncode, stdout, stderr = run_tracker_collect(new_name.strip())
+                if returncode == 0:
+                    st.success(f"Site **{new_name}** ajouté et données collectées !")
+                else:
+                    st.warning(f"Site ajouté mais erreur lors de la collecte. Détails : {stderr or stdout}")
+                st.cache_data.clear()
                 st.rerun()
             elif resp.status_code == 409:
                 st.error("Ce site existe déjà.")
             else:
                 st.error(f"Erreur: {resp.status_code} — {resp.text}")
-
-    # Section suppression
-    if sites_data:
-        st.markdown("---")
-        st.subheader("Supprimer un site")
-        site_to_delete = st.selectbox(
-            "Site à supprimer",
-            options=sites_data,
-            format_func=lambda s: f"{s['name']} ({s['url']})",
-            key="delete_site",
-        )
-        if st.button("Supprimer", type="secondary"):
-            httpx.delete(
-                f"{SUPABASE_URL}/rest/v1/sites",
-                headers=HEADERS,
-                params={"id": f"eq.{site_to_delete['id']}"},
-                timeout=10.0,
-            )
-            st.success(f"Site {site_to_delete['name']} supprimé.")
-            st.rerun()
 
 
 @st.cache_data(ttl=300)

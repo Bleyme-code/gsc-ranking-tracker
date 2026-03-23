@@ -399,7 +399,8 @@ DB_FILE = "gsc_data.db"
 
 def init_db(db_path: str):
     """Crée la base de données et les tables si elles n'existent pas."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS weekly_data (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,12 +440,11 @@ def init_db(db_path: str):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_site ON weekly_data(site, week_start)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_site ON weekly_summary(site, week_start)")
 
-    # Ajouter les colonnes trends_up et trends_down si elles n'existent pas encore
+    # Ajouter les colonnes manquantes si elles n'existent pas encore
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(weekly_summary)").fetchall()}
-    if "trends_up" not in existing_cols:
-        conn.execute("ALTER TABLE weekly_summary ADD COLUMN trends_up INTEGER DEFAULT 0")
-    if "trends_down" not in existing_cols:
-        conn.execute("ALTER TABLE weekly_summary ADD COLUMN trends_down INTEGER DEFAULT 0")
+    for col in ["cannibalization", "trends_up", "trends_down"]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE weekly_summary ADD COLUMN {col} INTEGER DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -455,7 +455,7 @@ def save_to_db(db_path: str, site_url: str, data: dict, analysis: dict):
     Sauvegarde les données hebdomadaires et le résumé dans SQLite.
     Utilise INSERT OR REPLACE pour éviter les doublons.
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     now = datetime.now().isoformat()
     short_name = site_url.replace("sc-domain:", "").replace("https://", "").rstrip("/")
 
@@ -624,6 +624,74 @@ def fetch_sites_from_supabase(supabase_config: dict) -> list:
     except Exception as e:
         print(f"  [SUPABASE] Impossible de charger les sites: {e}")
     return []
+
+
+def sync_gsc_sites_to_supabase(service, supabase_config: dict):
+    """
+    Récupère tous les sites du compte GSC et les synchronise dans la table
+    Supabase `sites`. Les nouveaux sites sont ajoutés en inactif (active=false).
+    Les sites existants ne sont pas modifiés.
+    """
+    url = supabase_config["url"]
+    key = supabase_config["key"]
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+
+    # 1. Récupérer les sites depuis GSC
+    print("[GSC] Récupération des sites du compte Google Search Console...")
+    response = service.sites().list().execute()
+    gsc_sites = response.get("siteEntry", [])
+
+    if not gsc_sites:
+        print("  Aucun site trouvé dans le compte GSC.")
+        return
+
+    print(f"  {len(gsc_sites)} site(s) trouvé(s) dans GSC.")
+
+    # 2. Récupérer les sites déjà dans Supabase
+    resp = httpx.get(
+        f"{url}/rest/v1/sites",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"},
+        params={"select": "url"},
+        timeout=10.0,
+    )
+    existing_urls = set()
+    if resp.status_code == 200:
+        existing_urls = {s["url"] for s in resp.json()}
+
+    # 3. Insérer les nouveaux sites (inactifs par défaut)
+    new_count = 0
+    for site in gsc_sites:
+        site_url = site["siteUrl"]
+        # Normaliser : ajouter / à la fin si absent
+        if not site_url.endswith("/") and not site_url.startswith("sc-domain:"):
+            site_url += "/"
+
+        if site_url in existing_urls:
+            print(f"  ✓ {site_url} — déjà dans le dashboard")
+            continue
+
+        # Générer un nom court
+        name = site_url.replace("sc-domain:", "").replace("https://", "").replace("http://", "").rstrip("/")
+
+        resp = httpx.post(
+            f"{url}/rest/v1/sites",
+            headers=headers,
+            json={"url": site_url, "name": name, "active": False},
+            timeout=10.0,
+        )
+        if resp.status_code in (200, 201):
+            print(f"  + {site_url} — ajouté (inactif)")
+            new_count += 1
+        else:
+            print(f"  ✗ {site_url} — erreur: {resp.status_code}")
+
+    print(f"\n[OK] Synchronisation terminée : {new_count} nouveau(x) site(s) ajouté(s).")
+    print("     Activez-les depuis le dashboard (Gestion des sites) pour les tracker.")
 
 
 # ============================================================
@@ -849,6 +917,10 @@ def main():
         "--site", default=None,
         help="Tracker un seul site (nom de domaine, ex: avis-malin.fr)"
     )
+    parser.add_argument(
+        "--sync-sites", action="store_true",
+        help="Importer les sites du compte GSC dans Supabase (sans collecter de données)"
+    )
     args = parser.parse_args()
 
     # Charger la config
@@ -893,6 +965,14 @@ def main():
     print("=" * 55)
     service = get_gsc_service(credentials_file, token_file)
     print("[OK] Connecté à Google Search Console.\n")
+
+    # Mode sync-sites : importer les sites GSC dans Supabase et quitter
+    if args.sync_sites:
+        if not supabase_config:
+            print("[ERREUR] Supabase non configuré. Ajoutez la section 'supabase' dans config.yaml.")
+            sys.exit(1)
+        sync_gsc_sites_to_supabase(service, supabase_config)
+        return
 
     # Collecter et analyser chaque site
     all_results = {}
